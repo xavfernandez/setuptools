@@ -1,44 +1,65 @@
-from glob import glob
-from distutils import log
-import distutils.command.sdist as orig
+from __future__ import annotations
+
+import contextlib
 import os
-import sys
-import io
+import re
+from collections.abc import Iterator
+from itertools import chain
+from typing import ClassVar
 
-from setuptools.extern import six
+from .._importlib import metadata
+from ..dist import Distribution
+from .build import _ORIGINAL_SUBCOMMANDS
 
-from setuptools.utils import cs_path_exists
-
-import pkg_resources
-
-READMES = 'README', 'README.rst', 'README.txt'
+import distutils.command.sdist as orig
+from distutils import log
 
 _default_revctrl = list
 
-def walk_revctrl(dirname=''):
+
+def walk_revctrl(dirname='') -> Iterator:
     """Find all files under revision control"""
-    for ep in pkg_resources.iter_entry_points('setuptools.file_finders'):
-        for item in ep.load()(dirname):
-            yield item
+    for ep in metadata.entry_points(group='setuptools.file_finders'):
+        yield from ep.load()(dirname)
 
 
 class sdist(orig.sdist):
     """Smart sdist that finds anything supported by revision control"""
 
-    user_options = [
-        ('formats=', None,
-         "formats for source distribution (comma-separated list)"),
-        ('keep-temp', 'k',
-         "keep the distribution tree around after creating " +
-         "archive file(s)"),
-        ('dist-dir=', 'd',
-         "directory to put the source distribution archive(s) in "
-         "[default: dist]"),
+    # Match the (narrower) type of the distutils sdist base rather than the
+    # Command base union, which mypy rejects as an incompatible override when
+    # distutils stubs are present (Python < 3.12).
+    user_options: ClassVar[list[tuple[str, str | None, str]]] = [
+        ('formats=', None, "formats for source distribution (comma-separated list)"),
+        (
+            'keep-temp',
+            'k',
+            "keep the distribution tree around after creating archive file(s)",
+        ),
+        (
+            'dist-dir=',
+            'd',
+            "directory to put the source distribution archive(s) in [default: dist]",
+        ),
+        (
+            'owner=',
+            'u',
+            "Owner name used when creating a tar file [default: current user]",
+        ),
+        (
+            'group=',
+            'g',
+            "Group name used when creating a tar file [default: current group]",
+        ),
     ]
 
-    negative_opt = {}
+    distribution: Distribution  # override distutils.dist.Distribution with setuptools.dist.Distribution
+    negative_opt: ClassVar[dict[str, str]] = {}
 
-    def run(self):
+    README_EXTENSIONS: ClassVar[list[str]] = ['', '.rst', '.txt', '.md']
+    READMES = tuple(f'README{ext}' for ext in README_EXTENSIONS)
+
+    def run(self) -> None:
         self.run_command('egg_info')
         ei_cmd = self.get_finalized_command('egg_info')
         self.filelist = ei_cmd.filelist
@@ -49,13 +70,6 @@ class sdist(orig.sdist):
         for cmd_name in self.get_sub_commands():
             self.run_command(cmd_name)
 
-        # Call check_metadata only if no 'check' command
-        # (distutils <= 2.6)
-        import distutils.command
-
-        if 'check' not in distutils.command.__all__:
-            self.check_metadata()
-
         self.make_distribution()
 
         dist_files = getattr(self.distribution, 'dist_files', [])
@@ -64,93 +78,105 @@ class sdist(orig.sdist):
             if data not in dist_files:
                 dist_files.append(data)
 
-    def __read_template_hack(self):
-        # This grody hack closes the template file (MANIFEST.in) if an
-        #  exception occurs during read_template.
-        # Doing so prevents an error when easy_install attempts to delete the
-        #  file.
+    def initialize_options(self) -> None:
+        orig.sdist.initialize_options(self)
+
+    def make_distribution(self) -> None:
+        """
+        Workaround for #516
+        """
+        with self._remove_os_link():
+            orig.sdist.make_distribution(self)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _remove_os_link():
+        """
+        In a context, remove and restore os.link if it exists
+        """
+
+        class NoValue:
+            pass
+
+        orig_val = getattr(os, 'link', NoValue)
         try:
-            orig.sdist.read_template(self)
-        except:
-            _, _, tb = sys.exc_info()
-            tb.tb_next.tb_frame.f_locals['template'].close()
-            raise
+            del os.link
+        except Exception:  # noqa: BLE001, S110 # best-effort; failure is non-fatal
+            pass
+        try:
+            yield
+        finally:
+            if orig_val is not NoValue:
+                os.link = orig_val
 
-    # Beginning with Python 2.7.2, 3.1.4, and 3.2.1, this leaky file handle
-    #  has been fixed, so only override the method if we're using an earlier
-    #  Python.
-    has_leaky_handle = (
-        sys.version_info < (2, 7, 2)
-        or (3, 0) <= sys.version_info < (3, 1, 4)
-        or (3, 2) <= sys.version_info < (3, 2, 1)
-    )
-    if has_leaky_handle:
-        read_template = __read_template_hack
+    def add_defaults(self) -> None:
+        super().add_defaults()
+        self._add_defaults_build_sub_commands()
 
-    def add_defaults(self):
-        standards = [READMES,
-                     self.distribution.script_name]
-        for fn in standards:
-            if isinstance(fn, tuple):
-                alts = fn
-                got_it = 0
-                for fn in alts:
-                    if cs_path_exists(fn):
-                        got_it = 1
-                        self.filelist.append(fn)
-                        break
+    def _add_defaults_optional(self):
+        super()._add_defaults_optional()
+        if os.path.isfile('pyproject.toml'):
+            self.filelist.append('pyproject.toml')
 
-                if not got_it:
-                    self.warn("standard file not found: should have one of " +
-                              ', '.join(alts))
-            else:
-                if cs_path_exists(fn):
-                    self.filelist.append(fn)
-                else:
-                    self.warn("standard file '%s' not found" % fn)
-
-        optional = ['test/test*.py', 'setup.cfg']
-        for pattern in optional:
-            files = list(filter(cs_path_exists, glob(pattern)))
-            if files:
-                self.filelist.extend(files)
-
-        # getting python files
+    def _add_defaults_python(self):
+        """getting python files"""
         if self.distribution.has_pure_modules():
             build_py = self.get_finalized_command('build_py')
             self.filelist.extend(build_py.get_source_files())
-            # This functionality is incompatible with include_package_data, and
-            # will in fact create an infinite recursion if include_package_data
-            # is True.  Use of include_package_data will imply that
-            # distutils-style automatic handling of package_data is disabled
-            if not self.distribution.include_package_data:
-                for _, src_dir, _, filenames in build_py.data_files:
-                    self.filelist.extend([os.path.join(src_dir, filename)
-                                          for filename in filenames])
+            self._add_data_files(self._safe_data_files(build_py))
 
-        if self.distribution.has_ext_modules():
-            build_ext = self.get_finalized_command('build_ext')
-            self.filelist.extend(build_ext.get_source_files())
+    def _add_defaults_build_sub_commands(self):
+        build = self.get_finalized_command("build")
+        missing_cmds = set(build.get_sub_commands()) - _ORIGINAL_SUBCOMMANDS
+        # ^-- the original built-in sub-commands are already handled by default.
+        cmds = (self.get_finalized_command(c) for c in missing_cmds)
+        files = (c.get_source_files() for c in cmds if hasattr(c, "get_source_files"))
+        self.filelist.extend(chain.from_iterable(files))
 
-        if self.distribution.has_c_libraries():
-            build_clib = self.get_finalized_command('build_clib')
-            self.filelist.extend(build_clib.get_source_files())
+    def _safe_data_files(self, build_py):
+        """
+        Since the ``sdist`` class is also used to compute the MANIFEST
+        (via :obj:`setuptools.command.egg_info.manifest_maker`),
+        there might be recursion problems when trying to obtain the list of
+        data_files and ``include_package_data=True`` (which in turn depends on
+        the files included in the MANIFEST).
 
-        if self.distribution.has_scripts():
-            build_scripts = self.get_finalized_command('build_scripts')
-            self.filelist.extend(build_scripts.get_source_files())
+        To avoid that, ``manifest_maker`` should be able to overwrite this
+        method and avoid recursive attempts to build/analyze the MANIFEST.
+        """
+        return build_py.data_files
 
-    def check_readme(self):
-        for f in READMES:
+    def _add_data_files(self, data_files):
+        """
+        Add data files as found in build_py.data_files.
+        """
+        self.filelist.extend(
+            os.path.join(src_dir, name)
+            for _, src_dir, _, filenames in data_files
+            for name in filenames
+        )
+
+    def _add_defaults_data_files(self):
+        try:
+            super()._add_defaults_data_files()
+        except TypeError:
+            log.warn("data_files contains unexpected objects")
+
+    def prune_file_list(self) -> None:
+        super().prune_file_list()
+        # Prevent accidental inclusion of test-related cache dirs at the project root
+        sep = re.escape(os.sep)
+        self.filelist.exclude_pattern(r"^(\.tox|\.nox|\.venv)" + sep, is_regex=True)
+
+    def check_readme(self) -> None:
+        for f in self.READMES:
             if os.path.exists(f):
                 return
-        else:
-            self.warn(
-                "standard file not found: should have one of " +
-                ', '.join(READMES)
-            )
+        self.warn(
+            "standard file not found: should have one of " + ', '.join(self.READMES)
+        )
 
-    def make_release_tree(self, base_dir, files):
+    def make_release_tree(self, base_dir, files) -> None:
         orig.sdist.make_release_tree(self, base_dir, files)
 
         # Save any egg_info command line options used to create this sdist
@@ -168,26 +194,24 @@ class sdist(orig.sdist):
         if not os.path.isfile(self.manifest):
             return False
 
-        with io.open(self.manifest, 'rb') as fp:
+        with open(self.manifest, 'rb') as fp:
             first_line = fp.readline()
-        return (first_line !=
-                '# file GENERATED by distutils, do NOT edit\n'.encode())
+        return first_line != b'# file GENERATED by distutils, do NOT edit\n'
 
-    def read_manifest(self):
+    def read_manifest(self) -> None:
         """Read the manifest file (named by 'self.manifest') and use it to
         fill in 'self.filelist', the list of files to include in the source
         distribution.
         """
         log.info("reading manifest file '%s'", self.manifest)
-        manifest = open(self.manifest, 'rb')
-        for line in manifest:
+        manifest = open(self.manifest, 'rb')  # noqa: SIM115 # handle managed explicitly
+        for bytes_line in manifest:
             # The manifest must contain UTF-8. See #303.
-            if six.PY3:
-                try:
-                    line = line.decode('UTF-8')
-                except UnicodeDecodeError:
-                    log.warn("%r not UTF-8 decodable -- skipping" % line)
-                    continue
+            try:
+                line = bytes_line.decode('UTF-8')
+            except UnicodeDecodeError:
+                log.warn(f"{line!r} not UTF-8 decodable -- skipping")
+                continue
             # ignore comments and blank lines
             line = line.strip()
             if line.startswith('#') or not line:

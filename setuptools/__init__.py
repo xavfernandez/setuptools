@@ -1,144 +1,227 @@
 """Extensions to the 'distutils' for large or complex distributions"""
+# mypy: disable_error_code=override
+# Command.reinitialize_command has an extra **kw param that distutils doesn't have
+# Can't disable on the exact line because distutils doesn't exists on Python 3.12
+# and mypy isn't aware of distutils_hack, causing distutils.core.Command to be Any,
+# and a [unused-ignore] to be raised on 3.12+
 
-import os
+from __future__ import annotations
+
 import functools
+import os
+import sys
+from abc import abstractmethod
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, TypeVar, overload
+
+sys.path.extend(((vendor_path := os.path.join(os.path.dirname(os.path.dirname(__file__)), 'setuptools', '_vendor')) not in sys.path) * [vendor_path])  # fmt: skip
+# workaround for #4476
+sys.modules.pop('backports', None)
+
+import _distutils_hack.override  # noqa: F401
+
+from . import logging, monkey
+from .depends import Require
+from .discovery import PackageFinder, PEP420PackageFinder
+from .dist import Distribution
+from .extension import Extension
+from .version import __version__ as __version__
+from .warnings import SetuptoolsDeprecationWarning
+
 import distutils.core
-import distutils.filelist
-from distutils.core import Command as _Command
-from distutils.util import convert_path
-from fnmatch import fnmatchcase
-
-from setuptools.extern.six.moves import filterfalse, map
-
-import setuptools.version
-from setuptools.extension import Extension
-from setuptools.dist import Distribution, Feature, _get_unpatched
-from setuptools.depends import Require
 
 __all__ = [
-    'setup', 'Distribution', 'Feature', 'Command', 'Extension', 'Require',
-    'find_packages'
+    'Command',
+    'Distribution',
+    'Extension',
+    'Require',
+    'SetuptoolsDeprecationWarning',
+    'find_namespace_packages',
+    'find_packages',
+    'setup',
 ]
 
-__version__ = setuptools.version.__version__
+_CommandT = TypeVar("_CommandT", bound="_Command")
 
 bootstrap_install_from = None
 
-# If we run 2to3 on .py files, should we also convert docstrings?
-# Default: yes; assume that we can detect doctests reliably
-run_2to3_on_doctests = True
-# Standard package names for fixer packages
-lib2to3_fixer_packages = ['lib2to3.fixes']
-
-
-class PackageFinder(object):
-    @classmethod
-    def find(cls, where='.', exclude=(), include=('*',)):
-        """Return a list all Python packages found within directory 'where'
-
-        'where' should be supplied as a "cross-platform" (i.e. URL-style)
-        path; it will be converted to the appropriate local path syntax.
-        'exclude' is a sequence of package names to exclude; '*' can be used
-        as a wildcard in the names, such that 'foo.*' will exclude all
-        subpackages of 'foo' (but not 'foo' itself).
-
-        'include' is a sequence of package names to include.  If it's
-        specified, only the named packages will be included.  If it's not
-        specified, all found packages will be included.  'include' can contain
-        shell style wildcard patterns just like 'exclude'.
-
-        The list of included packages is built up first and then any
-        explicitly excluded packages are removed from it.
-        """
-        out = cls._find_packages_iter(convert_path(where))
-        out = cls.require_parents(out)
-        includes = cls._build_filter(*include)
-        excludes = cls._build_filter('ez_setup', '*__pycache__', *exclude)
-        out = filter(includes, out)
-        out = filterfalse(excludes, out)
-        return list(out)
-
-    @staticmethod
-    def require_parents(packages):
-        """
-        Exclude any apparent package that apparently doesn't include its
-        parent.
-
-        For example, exclude 'foo.bar' if 'foo' is not present.
-        """
-        found = []
-        for pkg in packages:
-            base, sep, child = pkg.rpartition('.')
-            if base and base not in found:
-                continue
-            found.append(pkg)
-            yield pkg
-
-    @staticmethod
-    def _candidate_dirs(base_path):
-        """
-        Return all dirs in base_path that might be packages.
-        """
-        has_dot = lambda name: '.' in name
-        for root, dirs, files in os.walk(base_path, followlinks=True):
-            # Exclude directories that contain a period, as they cannot be
-            #  packages. Mutate the list to avoid traversal.
-            dirs[:] = filterfalse(has_dot, dirs)
-            for dir in dirs:
-                yield os.path.relpath(os.path.join(root, dir), base_path)
-
-    @classmethod
-    def _find_packages_iter(cls, base_path):
-        candidates = cls._candidate_dirs(base_path)
-        return (
-            path.replace(os.path.sep, '.')
-            for path in candidates
-            if cls._looks_like_package(os.path.join(base_path, path))
-        )
-
-    @staticmethod
-    def _looks_like_package(path):
-        return os.path.isfile(os.path.join(path, '__init__.py'))
-
-    @staticmethod
-    def _build_filter(*patterns):
-        """
-        Given a list of patterns, return a callable that will be true only if
-        the input matches one of the patterns.
-        """
-        return lambda name: any(fnmatchcase(name, pat=pat) for pat in patterns)
-
-class PEP420PackageFinder(PackageFinder):
-    @staticmethod
-    def _looks_like_package(path):
-        return True
-
 find_packages = PackageFinder.find
+find_namespace_packages = PEP420PackageFinder.find
 
-setup = distutils.core.setup
 
-_Command = _get_unpatched(_Command)
+def _install_setup_requires(attrs):
+    # Note: do not use `setuptools.Distribution` directly, as
+    # our PEP 517 backend patch `distutils.core.Distribution`.
+    class MinimalDistribution(distutils.core.Distribution):
+        """
+        A minimal version of a distribution for supporting the
+        fetch_build_eggs interface.
+        """
+
+        def __init__(self, attrs: Mapping[str, object]) -> None:
+            _incl = 'dependency_links', 'setup_requires'
+            filtered = {k: attrs[k] for k in set(_incl) & set(attrs)}
+            super().__init__(filtered)
+            # Prevent accidentally triggering discovery with incomplete set of attrs
+            self.set_defaults._disable()
+
+        def _get_project_config_files(self, filenames=None):
+            """Ignore ``pyproject.toml``, they are not related to setup_requires"""
+            try:
+                cfg, _toml = super()._split_standard_project_metadata(filenames)
+            except Exception:  # noqa: BLE001 # intentional broad fallback
+                return filenames, ()
+            return cfg, ()
+
+        def finalize_options(self):
+            """
+            Disable finalize_options to avoid building the working set.
+            Ref #2158.
+            """
+
+    dist = MinimalDistribution(attrs)
+
+    # Honor setup.cfg's options.
+    dist.parse_config_files(ignore_option_errors=True)
+    if dist.setup_requires:
+        _fetch_build_eggs(dist)
+
+
+def _fetch_build_eggs(dist: Distribution):
+    try:
+        dist.fetch_build_eggs(dist.setup_requires)
+    except Exception as ex:
+        msg = """
+        It is possible a package already installed in your system
+        contains an version that is invalid according to PEP 440.
+        You can try `pip install --use-pep517` as a workaround for this problem,
+        or rely on a new virtual environment.
+
+        If the problem refers to a package that is not installed yet,
+        please contact that package's maintainers or distributors.
+        """
+        if "InvalidVersion" in ex.__class__.__name__:
+            if hasattr(ex, "add_note"):
+                ex.add_note(msg)  # PEP 678
+            else:
+                dist.announce(f"\n{msg}\n")
+        raise
+
+
+def setup(**attrs) -> Distribution:
+    logging.configure()
+    # Make sure we have any requirements needed to interpret 'attrs'.
+    _install_setup_requires(attrs)
+    # Override return type of distutils.core.Distribution with setuptools.dist.Distribution
+    # (implicitly implemented via `setuptools.monkey.patch_all`).
+    return distutils.core.setup(**attrs)  # type: ignore[return-value]
+
+
+setup.__doc__ = distutils.core.setup.__doc__
+
+if TYPE_CHECKING:
+    # Work around a mypy issue where type[T] can't be used as a base: https://github.com/python/mypy/issues/10962
+    from distutils.core import Command as _Command
+else:
+    _Command = monkey.get_unpatched(distutils.core.Command)
+
 
 class Command(_Command):
-    __doc__ = _Command.__doc__
+    """
+    Setuptools internal actions are organized using a *command design pattern*.
+    This means that each action (or group of closely related actions) executed during
+    the build should be implemented as a ``Command`` subclass.
+
+    These commands are abstractions and do not necessarily correspond to a command that
+    can (or should) be executed via a terminal, in a CLI fashion (although historically
+    they would).
+
+    When creating a new command from scratch, custom defined classes **SHOULD** inherit
+    from ``setuptools.Command`` and implement a few mandatory methods.
+    Between these mandatory methods, are listed:
+    :meth:`initialize_options`, :meth:`finalize_options` and :meth:`run`.
+
+    A useful analogy for command classes is to think of them as subroutines with local
+    variables called "options".  The options are "declared" in :meth:`initialize_options`
+    and "defined" (given their final values, aka "finalized") in :meth:`finalize_options`,
+    both of which must be defined by every command class. The "body" of the subroutine,
+    (where it does all the work) is the :meth:`run` method.
+    Between :meth:`initialize_options` and :meth:`finalize_options`, ``setuptools`` may set
+    the values for options/attributes based on user's input (or circumstance),
+    which means that the implementation should be careful to not overwrite values in
+    :meth:`finalize_options` unless necessary.
+
+    Please note that other commands (or other parts of setuptools) may also overwrite
+    the values of the command's options/attributes multiple times during the build
+    process.
+    Therefore it is important to consistently implement :meth:`initialize_options` and
+    :meth:`finalize_options`. For example, all derived attributes (or attributes that
+    depend on the value of other attributes) **SHOULD** be recomputed in
+    :meth:`finalize_options`.
+
+    When overwriting existing commands, custom defined classes **MUST** abide by the
+    same APIs implemented by the original class. They also **SHOULD** inherit from the
+    original class.
+    """
 
     command_consumes_arguments = False
+    distribution: Distribution  # override distutils.dist.Distribution with setuptools.dist.Distribution
 
-    def __init__(self, dist, **kw):
+    dry_run = False  # type: ignore[assignment] # pyright: ignore[reportAssignmentType] (until #4689; see #4872)
+    """
+    For compatibility with vendored bdist_wheel.
+    https://github.com/pypa/setuptools/pull/4872/files#r1986395142
+    """
+
+    def __init__(self, dist: Distribution, **kw) -> None:
         """
         Construct the command for dist, updating
         vars(self) with any keyword parameters.
         """
-        _Command.__init__(self, dist)
+        super().__init__(dist)
         vars(self).update(kw)
 
-    def reinitialize_command(self, command, reinit_subcommands=0, **kw):
+    @overload
+    def reinitialize_command(
+        self, command: str, reinit_subcommands: bool = False, **kw
+    ) -> Command: ...  # override distutils.cmd.Command with setuptools.Command
+    @overload
+    def reinitialize_command(
+        self, command: _CommandT, reinit_subcommands: bool = False, **kw
+    ) -> _CommandT: ...
+    def reinitialize_command(
+        self, command: str | _Command, reinit_subcommands: bool = False, **kw
+    ) -> Command | _Command:
         cmd = _Command.reinitialize_command(self, command, reinit_subcommands)
         vars(cmd).update(kw)
-        return cmd
+        return cmd  # pyright: ignore[reportReturnType] # pypa/distutils#307
 
-# we can't patch distutils.cmd, alas
-distutils.core.Command = Command
+    @abstractmethod
+    def initialize_options(self) -> None:
+        """
+        Set or (reset) all options/attributes/caches used by the command
+        to their default values. Note that these values may be overwritten during
+        the build.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def finalize_options(self) -> None:
+        """
+        Set final values for all options/attributes used by the command.
+        Most of the time, each option/attribute/cache should only be set if it does not
+        have any value yet (e.g. ``if self.attr is None: self.attr = val``).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def run(self) -> None:
+        """
+        Execute the actions intended by the command.
+        (Side effects **SHOULD** only take place when :meth:`run` is executed,
+        for example, creating new files or writing to the terminal output).
+        """
+        raise NotImplementedError
 
 
 def _find_all_simple(path):
@@ -165,5 +248,9 @@ def findall(dir=os.curdir):
     return list(files)
 
 
-# fix findall bug in distutils (http://bugs.python.org/issue12885)
-distutils.filelist.findall = findall
+class sic(str):
+    """Treat this string as-is (https://en.wikipedia.org/wiki/Sic)"""
+
+
+# Apply monkey patches
+monkey.patch_all()

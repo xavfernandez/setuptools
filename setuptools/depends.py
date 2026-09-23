@@ -1,23 +1,36 @@
-import sys
-import imp
+from __future__ import annotations
+
+import contextlib
+import dis
 import marshal
-from imp import PKG_DIRECTORY, PY_COMPILED, PY_SOURCE, PY_FROZEN
-from distutils.version import StrictVersion
+import sys
+from types import CodeType
+from typing import Any, Literal, TypeVar
 
-from setuptools.extern import six
+from packaging.version import Version
 
-__all__ = [
-    'Require', 'find_module', 'get_module_constant', 'extract_constant'
-]
+from . import _imp
+from ._imp import PY_COMPILED, PY_FROZEN, PY_SOURCE, find_module
+
+_T = TypeVar("_T")
+
+__all__ = ['Require', 'find_module']
+
 
 class Require:
     """A prerequisite to building or installing a distribution"""
 
-    def __init__(self, name, requested_version, module, homepage='',
-            attribute=None, format=None):
-
+    def __init__(
+        self,
+        name,
+        requested_version,
+        module,
+        homepage: str = '',
+        attribute=None,
+        format=None,
+    ) -> None:
         if format is None and requested_version is not None:
-            format = StrictVersion
+            format = Version
 
         if format is not None:
             requested_version = format(requested_version)
@@ -30,16 +43,21 @@ class Require:
     def full_name(self):
         """Return full package/distribution name, w/version"""
         if self.requested_version is not None:
-            return '%s-%s' % (self.name,self.requested_version)
+            return f'{self.name}-{self.requested_version}'
         return self.name
 
     def version_ok(self, version):
         """Is 'version' sufficiently up-to-date?"""
-        return self.attribute is None or self.format is None or \
-            str(version) != "unknown" and version >= self.requested_version
+        return (
+            self.attribute is None
+            or self.format is None
+            or str(version) != "unknown"
+            and self.format(version) >= self.requested_version
+        )
 
-    def get_version(self, paths=None, default="unknown"):
-
+    def get_version(
+        self, paths=None, default: _T | Literal["unknown"] = "unknown"
+    ) -> _T | Literal["unknown"] | None | Any:
         """Get version number of installed module, 'None', or 'default'
 
         Search 'paths' for module.  If not found, return 'None'.  If found,
@@ -52,11 +70,12 @@ class Require:
 
         if self.attribute is None:
             try:
-                f,p,i = find_module(self.module,paths)
-                if f: f.close()
-                return default
+                f, _p, _i = find_module(self.module, paths)
             except ImportError:
                 return None
+            if f:
+                f.close()
+            return default
 
         v = get_module_constant(self.module, self.attribute, default, paths)
 
@@ -74,144 +93,92 @@ class Require:
         version = self.get_version(paths)
         if version is None:
             return False
-        return self.version_ok(version)
+        return self.version_ok(str(version))
 
 
-def _iter_code(code):
+def maybe_close(f):
+    @contextlib.contextmanager
+    def empty():
+        yield
 
-    """Yield '(op,arg)' pair for each operation in code object 'code'"""
+    if not f:
+        return empty()
 
-    from array import array
-    from dis import HAVE_ARGUMENT, EXTENDED_ARG
-
-    bytes = array('b',code.co_code)
-    eof = len(code.co_code)
-
-    ptr = 0
-    extended_arg = 0
-
-    while ptr<eof:
-
-        op = bytes[ptr]
-
-        if op>=HAVE_ARGUMENT:
-
-            arg = bytes[ptr+1] + bytes[ptr+2]*256 + extended_arg
-            ptr += 3
-
-            if op==EXTENDED_ARG:
-                long_type = six.integer_types[-1]
-                extended_arg = arg * long_type(65536)
-                continue
-
-        else:
-            arg = None
-            ptr += 1
-
-        yield op,arg
+    return contextlib.closing(f)
 
 
-def find_module(module, paths=None):
-    """Just like 'imp.find_module()', but with package support"""
+# Some objects are not available on some platforms.
+# XXX it'd be better to test assertions about bytecode instead.
+if not sys.platform.startswith('java') and sys.platform != 'cli':
 
-    parts = module.split('.')
+    def get_module_constant(
+        module, symbol, default: _T | int = -1, paths=None
+    ) -> _T | int | None | Any:
+        """Find 'module' by searching 'paths', and extract 'symbol'
 
-    while parts:
-        part = parts.pop(0)
-        f, path, (suffix,mode,kind) = info = imp.find_module(part, paths)
+        Return 'None' if 'module' does not exist on 'paths', or it does not define
+        'symbol'.  If the module defines 'symbol' as a constant, return the
+        constant.  Otherwise, return 'default'."""
 
-        if kind==PKG_DIRECTORY:
-            parts = parts or ['__init__']
-            paths = [path]
+        try:
+            f, path, (_suffix, _mode, kind) = info = find_module(module, paths)
+        except ImportError:
+            # Module doesn't exist
+            return None
 
-        elif parts:
-            raise ImportError("Can't find %r in %s" % (parts,module))
+        with maybe_close(f):
+            if kind == PY_COMPILED:
+                f.read(8)  # skip magic & date
+                code = marshal.load(f)
+            elif kind == PY_FROZEN:
+                code = _imp.get_frozen_object(module, paths)
+            elif kind == PY_SOURCE:
+                code = compile(f.read(), path, 'exec')
+            else:
+                # Not something we can parse; we'll have to import it.  :(
+                imported = _imp.get_module(module, paths, info)
+                return getattr(imported, symbol, None)
 
-    return info
+        return extract_constant(code, symbol, default)
 
+    def extract_constant(
+        code: CodeType, symbol: str, default: _T | int = -1
+    ) -> _T | int | None | Any:
+        """Extract the constant value of 'symbol' from 'code'
 
-def get_module_constant(module, symbol, default=-1, paths=None):
+        If the name 'symbol' is bound to a constant value by the Python code
+        object 'code', return that value.  If 'symbol' is bound to an expression,
+        return 'default'.  Otherwise, return 'None'.
 
-    """Find 'module' by searching 'paths', and extract 'symbol'
+        Return value is based on the first assignment to 'symbol'.  'symbol' must
+        be a global, or at least a non-"fast" local in the code block.  That is,
+        only 'STORE_NAME' and 'STORE_GLOBAL' opcodes are checked, and 'symbol'
+        must be present in 'code.co_names'.
+        """
+        if symbol not in code.co_names:
+            # name's not there, can't possibly be an assignment
+            return None
 
-    Return 'None' if 'module' does not exist on 'paths', or it does not define
-    'symbol'.  If the module defines 'symbol' as a constant, return the
-    constant.  Otherwise, return 'default'."""
+        name_idx = list(code.co_names).index(symbol)
 
-    try:
-        f, path, (suffix, mode, kind) = find_module(module, paths)
-    except ImportError:
-        # Module doesn't exist
+        STORE_NAME = dis.opmap['STORE_NAME']
+        STORE_GLOBAL = dis.opmap['STORE_GLOBAL']
+        LOAD_CONST = dis.opmap['LOAD_CONST']
+
+        const = default
+
+        for byte_code in dis.Bytecode(code):
+            op = byte_code.opcode
+            arg = byte_code.arg
+
+            if op == LOAD_CONST:
+                assert arg is not None
+                const = code.co_consts[arg]
+            elif arg == name_idx and (op == STORE_NAME or op == STORE_GLOBAL):
+                return const
+            else:
+                const = default
+
         return None
 
-    try:
-        if kind==PY_COMPILED:
-            f.read(8)   # skip magic & date
-            code = marshal.load(f)
-        elif kind==PY_FROZEN:
-            code = imp.get_frozen_object(module)
-        elif kind==PY_SOURCE:
-            code = compile(f.read(), path, 'exec')
-        else:
-            # Not something we can parse; we'll have to import it.  :(
-            if module not in sys.modules:
-                imp.load_module(module, f, path, (suffix, mode, kind))
-            return getattr(sys.modules[module], symbol, None)
-
-    finally:
-        if f:
-            f.close()
-
-    return extract_constant(code, symbol, default)
-
-
-def extract_constant(code, symbol, default=-1):
-    """Extract the constant value of 'symbol' from 'code'
-
-    If the name 'symbol' is bound to a constant value by the Python code
-    object 'code', return that value.  If 'symbol' is bound to an expression,
-    return 'default'.  Otherwise, return 'None'.
-
-    Return value is based on the first assignment to 'symbol'.  'symbol' must
-    be a global, or at least a non-"fast" local in the code block.  That is,
-    only 'STORE_NAME' and 'STORE_GLOBAL' opcodes are checked, and 'symbol'
-    must be present in 'code.co_names'.
-    """
-
-    if symbol not in code.co_names:
-        # name's not there, can't possibly be an assigment
-        return None
-
-    name_idx = list(code.co_names).index(symbol)
-
-    STORE_NAME = 90
-    STORE_GLOBAL = 97
-    LOAD_CONST = 100
-
-    const = default
-
-    for op, arg in _iter_code(code):
-
-        if op==LOAD_CONST:
-            const = code.co_consts[arg]
-        elif arg==name_idx and (op==STORE_NAME or op==STORE_GLOBAL):
-            return const
-        else:
-            const = default
-
-
-def _update_globals():
-    """
-    Patch the globals to remove the objects not available on some platforms.
-
-    XXX it'd be better to test assertions about bytecode instead.
-    """
-
-    if not sys.platform.startswith('java') and sys.platform != 'cli':
-        return
-    incompatible = 'extract_constant', 'get_module_constant'
-    for name in incompatible:
-        del globals()[name]
-        __all__.remove(name)
-
-_update_globals()
+    __all__ += ['extract_constant', 'get_module_constant']
